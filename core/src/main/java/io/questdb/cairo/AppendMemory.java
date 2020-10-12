@@ -43,56 +43,20 @@ public class AppendMemory extends VirtualMemory {
     public AppendMemory() {
     }
 
-    static void bestEffortClose(FilesFacade ff, Log log, long fd, boolean truncate, long size, long mapPageSize) {
-        try {
-            if (truncate) {
-                bestEffortTruncate(ff, log, fd, size, mapPageSize);
-            } else {
-                log.info().$("closed [fd=").$(fd).$(']').$();
-            }
-        } finally {
-            ff.close(fd);
-        }
-    }
-
-    static void bestEffortTruncate(FilesFacade ff, Log log, long fd, long size, long mapPageSize) {
-        if (ff.truncate(fd, size)) {
-            log.info().$("truncated and closed [fd=").$(fd).$(']').$();
-        } else {
-            if (ff.isRestrictedFileSystem()) {
-                // Windows does truncate file if it has a mapped page somewhere, could be another handle and process.
-                // To make it work size needs to be rounded up to nearest page.
-                long n = size / mapPageSize;
-                if (ff.truncate(fd, (n + 1) * mapPageSize)) {
-                    log.info().$("truncated and closed, second attempt [fd=").$(fd).$(']').$();
-                    return;
-                }
-            }
-            log.info().$("closed without truncate [fd=").$(fd).$(", errno=").$(ff.errno()).$(']').$();
-        }
-    }
-
     @Override
     public void close() {
         close(true);
     }
 
-    public final void setSize(long size) {
-        jumpTo(size);
+    @Override
+    protected long mapWritePage(int page) {
+        releaseCurrentPage();
+        return pageAddress = mapPage(page);
     }
 
-    public void truncate() {
-        if (fd == -1) {
-            // are we closed ?
-            return;
-        }
-
-        releaseCurrentPage();
-        if (!ff.truncate(fd, getMapPageSize())) {
-            throw CairoException.instance(ff.errno()).put("Cannot truncate fd=").put(fd).put(" to ").put(getMapPageSize()).put(" bytes");
-        }
-        updateLimits(0, pageAddress = mapPage(0));
-        LOG.info().$("truncated [fd=").$(fd).$(']').$();
+    @Override
+    protected void release(int page, long address) {
+        ff.munmap(address, getPageSize(page));
     }
 
     public final void close(boolean truncate) {
@@ -108,8 +72,25 @@ public class AppendMemory extends VirtualMemory {
         }
     }
 
+    public void ensureFileSize(int page) {
+        long target = pageOffset(page + 1);
+        if (ff.length(Math.abs(fd)) < target && !ff.truncate(Math.abs(fd), target)) {
+            throw CairoException.instance(ff.errno()).put("Appender resize failed fd=").put(fd).put(", size=").put(target);
+        }
+    }
+
     public long getFd() {
         return fd;
+    }
+
+    public long mapPage(int page) {
+        ensureFileSize(page);
+        long offset = pageOffset(page);
+        long address = ff.mmap(Math.abs(fd), getMapPageSize(), offset, Files.MAP_RW);
+        if (address != -1) {
+            return address;
+        }
+        throw CairoException.instance(ff.errno()).put("Could not mmap append fd=").put(fd).put(", offset=").put(offset).put(", size=").put(getMapPageSize());
     }
 
     public final void of(FilesFacade ff, LPSZ name, long pageSize) {
@@ -123,19 +104,15 @@ public class AppendMemory extends VirtualMemory {
         LOG.info().$("open ").$(name).$(" [fd=").$(fd).$(", pageSize=").$(pageSize).$(']').$();
     }
 
-    FilesFacade getFilesFacade() {
-        return ff;
+    public final void of(FilesFacade ff, long fd, long pageSize) {
+        close();
+        this.ff = ff;
+        setPageSize(pageSize);
+        this.fd = fd;
     }
 
-    @Override
-    protected long mapWritePage(int page) {
-        releaseCurrentPage();
-        return pageAddress = mapPage(page);
-    }
-
-    @Override
-    protected void release(int page, long address) {
-        ff.munmap(address, getPageSize(page));
+    public final void setSize(long size) {
+        jumpTo(size);
     }
 
     public void sync(boolean async) {
@@ -147,27 +124,59 @@ public class AppendMemory extends VirtualMemory {
         }
     }
 
+    public void truncate() {
+        if (fd == -1) {
+            // are we closed ?
+            return;
+        }
+
+        releaseCurrentPage();
+        if (!ff.truncate(Math.abs(fd), getMapPageSize())) {
+            throw CairoException.instance(ff.errno()).put("Cannot truncate fd=").put(fd).put(" to ").put(getMapPageSize()).put(" bytes");
+        }
+        updateLimits(0, pageAddress = mapPage(0));
+        LOG.info().$("truncated [fd=").$(fd).$(']').$();
+    }
+
+    static void bestEffortClose(FilesFacade ff, Log log, long fd, boolean truncate, long size, long mapPageSize) {
+        try {
+            if (truncate) {
+                bestEffortTruncate(ff, log, fd, size, mapPageSize);
+            } else {
+                log.info().$("closed [fd=").$(fd).$(']').$();
+            }
+        } finally {
+            if (fd > 0) {
+                ff.close(fd);
+            }
+        }
+    }
+
+    static void bestEffortTruncate(FilesFacade ff, Log log, long fd, long size, long mapPageSize) {
+        if (ff.truncate(Math.abs(fd), size)) {
+            log.info().$("truncated and closed [fd=").$(fd).$(']').$();
+        } else {
+            if (ff.isRestrictedFileSystem()) {
+                // Windows does truncate file if it has a mapped page somewhere, could be another handle and process.
+                // To make it work size needs to be rounded up to nearest page.
+                long n = size / mapPageSize;
+                if (ff.truncate(Math.abs(fd), (n + 1) * mapPageSize)) {
+                    log.info().$("truncated and closed, second attempt [fd=").$(fd).$(']').$();
+                    return;
+                }
+            }
+            log.info().$("closed without truncate [fd=").$(fd).$(", errno=").$(ff.errno()).$(']').$();
+        }
+    }
+
+    FilesFacade getFilesFacade() {
+        return ff;
+    }
+
     void releaseCurrentPage() {
         if (pageAddress != 0) {
             release(0, pageAddress);
             pageAddress = 0;
         }
-    }
-
-    public void ensureFileSize(int page) {
-        long target = pageOffset(page + 1);
-        if (ff.length(fd) < target && !ff.truncate(fd, target)) {
-            throw CairoException.instance(ff.errno()).put("Appender resize failed fd=").put(fd).put(", size=").put(target);
-        }
-    }
-
-    public long mapPage(int page) {
-        ensureFileSize(page);
-        long offset = pageOffset(page);
-        long address = ff.mmap(fd, getMapPageSize(), offset, Files.MAP_RW);
-        if (address != -1) {
-            return address;
-        }
-        throw CairoException.instance(ff.errno()).put("Could not mmap append fd=").put(fd).put(", offset=").put(offset).put(", size=").put(getMapPageSize());
     }
 }
